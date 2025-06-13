@@ -1,0 +1,114 @@
+
+The architecture:
+1.  **GitHub:** When a Pull Request is opened, a reviewer is requested, or it's closed, GitHub sends a webhook event.
+2.  **Web Server (Flask App):** A Python Flask application will listen for these webhooks at a public endpoint.
+3.  **ngrok:** During development, we'll use `ngrok` to expose our local Flask app to the internet so GitHub can reach it.
+4.  **Gemini Service:** The Flask app will call our `gemini_service.py` to summarize the PR's title and body.
+5.  **Scheduler (APScheduler):** We'll use a scheduler within the Flask app to handle the periodic reminders.
+6.  **Slack API:** The app will use the Slack API to send Direct Messages to the appropriate users.
+
+---
+
+### Prerequisites
+
+1.  **Python 3.8+:** Ensure you have Python installed.
+2.  **Slack Workspace:** Admin access to a Slack workspace to create an app.
+3.  **GitHub Repository:** A repository where you can configure webhooks.
+4.  **ngrok:** [Download and install ngrok](https://ngrok.com/download) to expose your local server.
+5.  **Google AI API Key:** Get an API key for the Gemini API from [Google AI Studio](https://aistudio.google.com/app/apikey).
+
+---
+
+### Part 1: Setting up the Slack App
+
+1.  **Create the App:**
+    *   Go to [https://api.slack.com/apps](https://api.slack.com/apps) and click "Create New App".
+    *   Choose "From scratch".
+    *   Give it a name (e.g., "GitHub PR Notifier") and select your workspace.
+
+2.  **Set Permissions (Scopes):**
+    *   In the left sidebar, navigate to **OAuth & Permissions**.
+    *   Scroll down to the "Scopes" section.
+    *   Under "Bot Token Scopes", click "Add an OAuth Scope" and add the following:
+        *   `chat:write`: To send messages.
+        *   `users:read.email`: To find users by their email address (a reliable way to map from GitHub to Slack).
+
+3.  **Install the App:**
+    *   Scroll back to the top of the **OAuth & Permissions** page.
+    *   Click "Install to Workspace".
+    *   Allow the installation.
+    *   After installation, you will see a **"Bot User OAuth Token"**. It will start with `xoxb-`. **Copy this token** and keep it safe.
+
+4.  **Get Slack User IDs:**
+    *   To send DMs, you need the Slack Member ID of each user (e.g., `U024BE7LH`).
+    *   The easiest way to find this is to go to a user's profile in Slack, click the three-dot menu, and select "Copy member ID".
+    *   We will use these IDs in our configuration file.
+
+---
+
+### Part 2: Setting up the GitHub Webhook
+
+1.  **Start ngrok:**
+    *   Open your terminal and run the following command. We'll use port 5000 for our Flask app.
+    ```bash
+    ngrok http 5000
+    ```
+    *   ngrok will give you a public "Forwarding" URL (e.g., `https://random-string.ngrok-free.app`). **Copy the `https://` URL.**
+
+2.  **Configure the Webhook:**
+    *   Go to the GitHub repository you want to monitor.
+    *   Click on **Settings** > **Webhooks**.
+    *   Click **Add webhook**.
+    *   **Payload URL:** Paste your ngrok URL and add `/github/webhook` to the end (e.g., `https://random-string.ngrok-free.app/github/webhook`).
+    *   **Content type:** Change this to `application/json`.
+    *   **Secret:** Create a strong, random string to use as a secret. This is crucial for security. **Copy this secret**.
+    *   **Which events would you like to trigger this webhook?** Select "Let me select individual events." and check only **Pull requests**.
+    *   Ensure "Active" is checked and click **Add webhook**.
+
+---
+
+### Part 3: Running the Application
+
+1.  **Install Dependencies:**
+    ```bash
+    pip install -r requirements.txt
+    ```
+2.  **Start ngrok (if you haven't already):**
+    ```bash
+    ngrok http 5000
+    ```
+    Make sure your GitHub webhook is configured with the ngrok URL.
+3.  **Run the Flask App:**
+    ```bash
+    python app.py
+    ```
+
+You should see output like:
+`INFO:root:Starting GitHub PR Notifier App...`
+`* Serving Flask app 'app'`
+`* Running on http://127.0.0.1:5000`
+
+### How It Works: A Test Case
+
+1.  User `octocat` opens a new PR in your repository.
+2.  GitHub sends a `pull_request` webhook with `action: "opened"` to your ngrok URL.
+3.  The Flask app receives it, verifies the signature, and sees it's a PR event.
+4.  `handle_pull_request_event` is called. It sees `action: "opened"`.
+5.  It checks if `octocat` is in `USER_MAPPING`. It is.
+6.  It calls the Gemini service to get a summary.
+7.  It DMs the corresponding Slack user (`U024BE7LH`) with the "Your PR was opened" message.
+8.  Another developer requests a review from `monalisa`.
+9.  GitHub sends another webhook, this time with `action: "review_requested"`.
+10. The app receives it and finds `monalisa` in the `USER_MAPPING`.
+11. It DMs her Slack user (`U012ABC3DE`) with the "Your review is requested" message.
+12. Crucially, it also calls `schedule_reminder`, which adds a job to `APScheduler` to run `send_reminder` for `monalisa` in 24 hours.
+13. If the PR is merged 10 hours later, a webhook with `action: "closed"` and `merged: true` is sent. The app receives this and calls `cancel_reminders`, removing the scheduled job for `monalisa` so she doesn't get a pointless reminder.
+
+---
+
+### Production Considerations & Improvements
+
+*   **Persistence:** The current `APScheduler` uses a `MemoryJobStore`, which means all scheduled reminders will be lost if the app restarts. For production, you should use a persistent job store like `SQLAlchemyJobStore` (with a database like PostgreSQL or SQLite) or `RedisJobStore`.
+*   **Deployment:** Instead of `ngrok` and `python app.py`, deploy this application to a proper hosting service like Heroku, AWS Elastic Beanstalk, or a DigitalOcean Droplet using a production-grade web server like Gunicorn.
+*   **State Management:** If the app starts while PRs are already open and awaiting review, it won't know about them. You could add a startup function that queries the GitHub API for all open PRs involving your mapped users and schedules initial reminders.
+*   **Advanced Configuration:** You could move configuration like reminder times into the `.env` file or manage it through an admin interface.

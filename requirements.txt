@@ -1,0 +1,6 @@
+# requirements.txt
+slack_sdk
+Flask
+python-dotenv
+google-generativeai
+APScheduler
