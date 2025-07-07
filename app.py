@@ -4,7 +4,9 @@ import hmac
 import hashlib
 import json
 import logging
+import sys
 from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
 
 from flask import Flask, request, abort
 from slack_sdk import WebClient
@@ -16,14 +18,32 @@ from config import USER_MAPPING, REMINDER_DELAY_HOURS, REMINDER_INTERVAL_HOURS
 import gemini_service
 
 # --- Initialization ---
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 load_dotenv()
+
+# Validate required environment variables
+required_env_vars = ['SLACK_BOT_TOKEN', 'GITHUB_WEBHOOK_SECRET', 'GEMINI_API_KEY']
+missing_vars = [var for var in required_env_vars if not os.environ.get(var)]
+if missing_vars:
+    logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
+    sys.exit(1)
 
 app = Flask(__name__)
 
 # Slack client
 slack_token = os.environ["SLACK_BOT_TOKEN"]
-slack_client = WebClient(token=slack_token)
+try:
+    slack_client = WebClient(token=slack_token)
+    # Test connection
+    slack_client.auth_test()
+except SlackApiError as e:
+    logger.error(f"Failed to initialize Slack client: {e}")
+    sys.exit(1)
 
 # GitHub webhook secret
 github_secret = os.environ["GITHUB_WEBHOOK_SECRET"].encode('utf-8')
@@ -32,18 +52,74 @@ github_secret = os.environ["GITHUB_WEBHOOK_SECRET"].encode('utf-8')
 scheduler = BackgroundScheduler()
 scheduler.start()
 
+# Rate limiting (simple in-memory store)
+from collections import defaultdict
+request_counts = defaultdict(int)
+RATE_LIMIT_WINDOW = 60  # seconds
+RATE_LIMIT_MAX_REQUESTS = 100
+
 
 # --- Security ---
-def verify_github_signature(payload_body, signature_header):
+def is_rate_limited(client_ip: str) -> bool:
+    """Simple rate limiting check."""
+    current_time = datetime.now()
+    
+    # Clean old entries
+    cutoff_time = current_time - timedelta(seconds=RATE_LIMIT_WINDOW)
+    
+    # This is a simplified implementation - in production, use Redis or similar
+    request_counts[client_ip] += 1
+    if request_counts[client_ip] > RATE_LIMIT_MAX_REQUESTS:
+        logger.warning(f"Rate limit exceeded for IP: {client_ip}")
+        return True
+    
+    return False
+
+def verify_github_signature(payload_body: bytes, signature_header: str) -> bool:
     """Verify that the payload was sent from GitHub by validating the signature."""
     if not signature_header:
-        logging.warning("No X-Hub-Signature-256 header on request.")
+        logger.warning("No X-Hub-Signature-256 header on request.")
         return False
+    
+    if not signature_header.startswith('sha256='):
+        logger.warning("Invalid signature format")
+        return False
+    
     hash_object = hmac.new(github_secret, msg=payload_body, digestmod=hashlib.sha256)
     expected_signature = "sha256=" + hash_object.hexdigest()
+    
     if not hmac.compare_digest(expected_signature, signature_header):
-        logging.warning("Request signature does not match.")
+        logger.warning("Request signature does not match.")
         return False
+    
+    return True
+
+def validate_webhook_payload(payload: Dict[str, Any]) -> bool:
+    """Validate the structure of the webhook payload."""
+    if not isinstance(payload, dict):
+        return False
+    
+    # Check required fields
+    if 'action' not in payload:
+        return False
+    
+    if 'pull_request' not in payload:
+        return False
+    
+    pr = payload['pull_request']
+    if not isinstance(pr, dict):
+        return False
+    
+    required_pr_fields = ['title', 'html_url', 'user']
+    for field in required_pr_fields:
+        if field not in pr:
+            return False
+    
+    # Validate URL format
+    pr_url = pr.get('html_url', '')
+    if not pr_url.startswith('https://github.com/'):
+        return False
+    
     return True
 
 # --- Slack Messaging ---
@@ -173,19 +249,42 @@ def cancel_reminders(pr_url):
 # --- Webhook Handler ---
 @app.route('/github/webhook', methods=['POST'])
 def github_webhook():
-    # 1. Verify the signature
+    client_ip = request.remote_addr
+    
+    # 1. Rate limiting
+    if is_rate_limited(client_ip):
+        logger.warning(f"Rate limit exceeded for {client_ip}")
+        abort(429, 'Rate limit exceeded')
+    
+    # 2. Verify the signature
     signature = request.headers.get('X-Hub-Signature-256')
     if not verify_github_signature(request.data, signature):
+        logger.warning(f"Invalid signature from {client_ip}")
         abort(400, 'Invalid signature.')
 
-    # 2. Check the event type
+    # 3. Check the event type
     event_type = request.headers.get('X-GitHub-Event')
     if event_type != 'pull_request':
+        logger.info(f"Unsupported event type: {event_type}")
         return 'Event not supported.', 200
 
-    # 3. Process the payload
-    payload = request.json
-    handle_pull_request_event(payload)
+    # 4. Validate and process the payload
+    try:
+        payload = request.json
+        if not payload:
+            logger.warning("Empty payload received")
+            abort(400, 'Empty payload')
+        
+        if not validate_webhook_payload(payload):
+            logger.warning("Invalid payload structure")
+            abort(400, 'Invalid payload structure')
+        
+        handle_pull_request_event(payload)
+        logger.info(f"Successfully processed webhook for action: {payload.get('action')}")
+        
+    except Exception as e:
+        logger.error(f"Error processing webhook: {str(e)}")
+        abort(500, 'Internal server error')
     
     return 'Event received.', 200
 
@@ -231,6 +330,13 @@ def handle_pull_request_event(payload):
 
 
 if __name__ == '__main__':
-    logging.info("Starting GitHub PR Notifier App...")
-    # Port must match the ngrok command
-    app.run(port=5000, debug=True)
+    logger.info("Starting GitHub PR Notifier App...")
+    
+    # Get configuration from environment
+    port = int(os.environ.get('PORT', 5000))
+    debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
+    
+    if debug_mode:
+        logger.warning("Running in debug mode - DO NOT USE IN PRODUCTION")
+    
+    app.run(host='0.0.0.0', port=port, debug=debug_mode)
